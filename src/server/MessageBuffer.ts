@@ -1,15 +1,17 @@
-const SEGMENT_BITS = 0x7F;
-const CONTINUE_BIT = 0x80;
+import { Uuid, UuidTool } from "uuid-tool";
+
+const SEGMENT_BITS = 127;
+const CONTINUE_BIT = 128;
 
 
 export default class MessageBuffer {
   private buffer: Buffer;
 
-  constructor(buffer: Buffer) {
+  constructor(buffer: Buffer=Buffer.alloc(0)) {
     this.buffer = buffer;
   }
 
-  getBoolean(): boolean {
+  readBoolean(): boolean {
     return this.readByte() === 1;
   }
 
@@ -19,23 +21,15 @@ export default class MessageBuffer {
     return bytes;
   }
 
-  private readNumber(amount: number=1, signed: boolean=true) {
+  private readNumber(amount: number=1, signed: boolean=true): number {
     const bytes = this.readBytes(amount);
-    let number = 0;
-    for (let i = 0; i < amount; i++) {
-      number += bytes.readUInt8(i) << (i * 8);
-    }
-    if (signed) {
-      number = number >> 1;
-      number = number ^ -(number & 1);
-    }
-    return number;
+    return signed ? bytes.readIntBE(0, amount) : bytes.readUintBE(0, amount);
   }
 
   readByte(): number {
     // An integer between -128 and 127
     // Signed 8-bit integer, two's complement [https://en.wikipedia.org/wiki/Two%27s_complement]
-    return this.readNumber();
+    return this.readNumber(1);
   }
 
   readUnsignedByte(): number {
@@ -59,13 +53,14 @@ export default class MessageBuffer {
   readInt(): number {
     // An integer between -2147483648 and 2147483647
     // Signed 32-bit integer, two's complement
-    return this.readNumber(4);
+    return this.readNumber(4)
   }
 
   readLong(): number {
     // An integer between -9223372036854775808 and 9223372036854775807
     // Signed 64-bit integer, two's complement
-    return this.readNumber(8);
+    const bytes = this.readBytes(8);
+    return bytes.readInt8(0)
   }
 
   readFloat(): number {
@@ -83,7 +78,7 @@ export default class MessageBuffer {
   readString(): string {
     // A sequence of Unicode scalar values [https://en.wikipedia.org/wiki/Unicode] [https://unicode.org/glossary/#unicode_scalar_value]
     // UTF-8 [https://en.wikipedia.org/wiki/UTF-8] string prefixed with its size in bytes as a VarInt. Maximum length of n characters, which varies by context; up to n × 4 bytes can be used to encode n characters and both of those limits are checked. Maximum n value is 32767. The + 3 is due to the max size of a valid length VarInt
-    const length = this.readVarInt() + 3;
+    const length = this.readVarInt();
     const bytes = this.readBytes(length);
     return bytes.toString("utf8");
   }
@@ -127,9 +122,10 @@ export default class MessageBuffer {
 
     while (true) {
       currentByte = this.readByte();
-      value |= (currentByte & SEGMENT_BITS) << position;
 
-      if ((currentByte & CONTINUE_BIT) == 0) break;
+      value = ((currentByte & SEGMENT_BITS) << position) | value;
+
+      if ((currentByte & CONTINUE_BIT) === 0) break;
 
       position += 7;
 
@@ -179,8 +175,20 @@ export default class MessageBuffer {
     return value;
   }
 
-  private writeBytes(value: Buffer) {
+  readUUID(): string {
+    return new Uuid(Array.from(this.readBytes(16))).toString();
+  }
+
+  toBytes(): Buffer {
+    return this.buffer;
+  }
+
+  writeBytes(value: Buffer) {
     this.buffer = Buffer.concat([this.buffer, value]);
+  }
+
+  private writeBytesAtStart(value: Buffer) {
+    this.buffer = Buffer.concat([value, this.buffer]);
   }
 
   writeBoolean(value: boolean) {
@@ -188,11 +196,14 @@ export default class MessageBuffer {
   }
 
   private writeNumber(value: number, amount: number=1, signed: boolean=true) {
-    const bytes = Buffer.alloc(amount);
-    for (let i = 0; i < amount; i++) {
-      bytes.writeUInt8(value >> (i * 8), i);
+    const buf = Buffer.alloc(amount);
+    if (signed) {
+      buf.writeInt8(value, this.buffer.length);
+    } else {
+      buf.writeUIntBE(value, this.buffer.length, amount);
     }
-    this.writeBytes(bytes);
+
+    this.writeBytes(buf);
   }
 
   writeByte(value: number) {
@@ -216,7 +227,9 @@ export default class MessageBuffer {
   }
 
   writeLong(value: number) {
-    this.writeNumber(value, 8);
+    const buf = Buffer.alloc(8);
+    buf.writeInt8(value, 0);
+    this.writeBytes(buf);
   }
 
   writeFloat(value: number) {
@@ -233,39 +246,54 @@ export default class MessageBuffer {
 
   writeString(value: string) {
     const bytes = Buffer.from(value, "utf8");
-    this.writeVarInt(bytes.length);
+    this.writeVarInt(value.length);
     this.writeBytes(bytes);
   }
 
-  writeVarInt(value: number) {
-    /*
-    public void writeVarInt(int value) {
-        while (true) {
-            if ((value & ~SEGMENT_BITS) == 0) {
-              writeByte(value);
-              return;
-            }
-
-            writeByte((value & SEGMENT_BITS) | CONTINUE_BIT);
-            // Note: >>> means that the sign bit is shifted with the rest of the number rather than being left alone
-            value >>>= 7;
-        }
-    }
-    */
+  private formatVarInt(value: number, byteslen: number=4): Buffer { // TODO: byteslen functional
+    let buf = Buffer.alloc(10);
+    let i = 0;
     while (true) {
       if ((value & ~SEGMENT_BITS) == 0) {
-        this.writeByte(value);
-        return;
+        buf.writeUintLE(value, i, 1);
+        break;
       }
 
-      this.writeByte((value & SEGMENT_BITS) | CONTINUE_BIT);
+      buf.writeUintLE((value & SEGMENT_BITS) | CONTINUE_BIT, i, 1);
       // Note: >>> means that the sign bit is shifted with the rest of the number rather than being left alone
       value >>>= 7;
+      i++;
     }
+
+    return buf.slice(0, i + 1);
+  }
+
+  writeVarInt(value: number) {
+    this.writeBytes(this.formatVarInt(value, 4))
   }
 
   writeVarLong(value: number) {
-    this.writeVarInt(value);
+    this.writeBytes(this.formatVarInt(value, 8))
+  }
+
+  writeUUID(value: string) {
+    this.writeBytes(Buffer.from(UuidTool.toBytes(value)));
+  }
+
+  writeLength() {
+    this.writeBytesAtStart(this.formatVarInt(this.buffer.length));
+  }
+
+  writeBuffer(buf: MessageBuffer) {
+    this.writeBytes(buf.buffer);
+  }
+
+  slice(amount: number): MessageBuffer {
+    return new MessageBuffer(this.readBytes(amount));
+  }
+
+  get length(): number {
+    return this.buffer.length;
   }
 
 }
